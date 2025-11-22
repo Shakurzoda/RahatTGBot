@@ -2,6 +2,7 @@ import asyncio
 from datetime import datetime, timedelta
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -519,28 +520,20 @@ async def admin_actions(callback: CallbackQuery, state: FSMContext):
 
         user_message_id = order.get("user_message_id")
         if user_message_id:
-            exc_text = await safe_edit_message_text(
-                callback.bot,
-                chat_id=order["user_id"],
-                message_id=user_message_id,
-                text=user_text,
-                reply_markup=user_markup,
-                order_id=order_id,
-                context="client",
-            )
-            if exc_text:
-                if "message is not modified" in exc_text:
-                    logger.info("Сообщение клиента без изменений для заказа %s", order_id)
-                else:
-                    try:
-                        new_msg = await callback.bot.send_message(
-                            chat_id=order["user_id"],
-                            text=user_text,
-                            reply_markup=user_markup,
-                        )
-                        set_user_message_id(order_id, new_msg.message_id)
-                    except Exception:
-                        logger.error("Не удалось отправить новое сообщение клиенту для заказа %s", order_id)
+            try:
+                await callback.bot.edit_message_text(
+                    chat_id=order["user_id"],
+                    message_id=user_message_id,
+                    text=user_text,
+                    reply_markup=user_markup,
+                )
+            except TelegramBadRequest as e:
+                logger.warning(
+                    "Не удалось обновить сообщение клиента для заказа %s: %s",
+                    order_id,
+                    e,
+                )
+                return
         else:
             logger.warning("Для заказа %s нет user_message_id. Отправляем новое сообщение.", order_id)
             try:
