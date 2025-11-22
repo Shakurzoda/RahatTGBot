@@ -2,7 +2,6 @@ import asyncio
 from datetime import datetime, timedelta
 
 from aiogram import F, Router
-from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -32,6 +31,7 @@ from keyboards import (
 )
 from logger import get_logger
 from utils import _safe_split, cart_total, format_cart, progress_text
+from telegram_utils import safe_edit_message_text
 
 # ----------------- Router -----------------
 router = Router()
@@ -488,18 +488,16 @@ async def admin_actions(callback: CallbackQuery, state: FSMContext):
             await callback.answer("Ошибка обновления статуса", show_alert=True)
             return
 
-        try:
-            await callback.message.edit_text(
-                _admin_order_text(order),
-                reply_markup=admin_order_kb(order_id, order["status"], has_courier=bool(order.get("courier"))),
-            )
-        except TelegramBadRequest as exc:
-            logger.warning(
-                "Не удалось обновить сообщение администратора для заказа %s: %s",
-                order_id,
-                exc,
-            )
-            exc_text = str(exc)
+        exc_text = await safe_edit_message_text(
+            callback.message.bot,
+            chat_id=callback.message.chat.id,
+            message_id=callback.message.message_id,
+            text=_admin_order_text(order),
+            reply_markup=admin_order_kb(order_id, order["status"], has_courier=bool(order.get("courier"))),
+            order_id=order_id,
+            context="admin",
+        )
+        if exc_text:
             if "message is not modified" in exc_text:
                 logger.info("Сообщение администратора не изменилось для заказа %s", order_id)
             elif "message to edit not found" in exc_text:
@@ -521,23 +519,19 @@ async def admin_actions(callback: CallbackQuery, state: FSMContext):
 
         user_message_id = order.get("user_message_id")
         if user_message_id:
-            try:
-                await callback.bot.edit_message_text(
-                    chat_id=order["user_id"],
-                    message_id=user_message_id,
-                    text=user_text,
-                    reply_markup=user_markup,
-                )
-            except TelegramBadRequest as exc:
-                exc_text = str(exc)
+            exc_text = await safe_edit_message_text(
+                callback.bot,
+                chat_id=order["user_id"],
+                message_id=user_message_id,
+                text=user_text,
+                reply_markup=user_markup,
+                order_id=order_id,
+                context="client",
+            )
+            if exc_text:
                 if "message is not modified" in exc_text:
                     logger.info("Сообщение клиента без изменений для заказа %s", order_id)
                 else:
-                    logger.warning(
-                        "Не удалось обновить сообщение клиента для заказа %s: %s",
-                        order_id,
-                        exc,
-                    )
                     try:
                         new_msg = await callback.bot.send_message(
                             chat_id=order["user_id"],
@@ -547,8 +541,6 @@ async def admin_actions(callback: CallbackQuery, state: FSMContext):
                         set_user_message_id(order_id, new_msg.message_id)
                     except Exception:
                         logger.error("Не удалось отправить новое сообщение клиенту для заказа %s", order_id)
-            except Exception:
-                logger.error("Не удалось обновить сообщение клиента для заказа %s", order_id)
         else:
             logger.warning("Для заказа %s нет user_message_id. Отправляем новое сообщение.", order_id)
             try:
@@ -606,18 +598,16 @@ async def admin_actions(callback: CallbackQuery, state: FSMContext):
         if not order:
             await callback.answer("Заказ не найден", show_alert=True)
             return
-        try:
-            await callback.message.edit_text(
-                _admin_order_text(order),
-                reply_markup=admin_order_kb(order_id, order["status"], has_courier=bool(order.get("courier"))),
-            )
-        except TelegramBadRequest as exc:
-            logger.warning(
-                "Не удалось обновить сообщение администратора для заказа %s: %s",
-                order_id,
-                exc,
-            )
-            exc_text = str(exc)
+        exc_text = await safe_edit_message_text(
+            callback.message.bot,
+            chat_id=callback.message.chat.id,
+            message_id=callback.message.message_id,
+            text=_admin_order_text(order),
+            reply_markup=admin_order_kb(order_id, order["status"], has_courier=bool(order.get("courier"))),
+            order_id=order_id,
+            context="admin",
+        )
+        if exc_text:
             if "message is not modified" in exc_text:
                 logger.info("Сообщение администратора без изменений для заказа %s", order_id)
             elif "message to edit not found" in exc_text:
@@ -650,36 +640,28 @@ async def set_courier_name(message: Message, state: FSMContext):
         await message.reply("Ошибка сохранения курьера. Попробуйте ещё раз")
         return
 
-    try:
-        await message.bot.edit_message_text(
-            chat_id=message.chat.id,
-            message_id=order["group_message_id"],
-            text=_admin_order_text(order),
-            reply_markup=admin_order_kb(order_id, order["status"], has_courier=True)
-        )
-    except TelegramBadRequest as exc:
-        logger.warning(
-            "Не удалось обновить сообщение администратора для заказа %s: %s",
-            order_id,
-            exc,
-        )
+    await safe_edit_message_text(
+        message.bot,
+        chat_id=message.chat.id,
+        message_id=order["group_message_id"],
+        text=_admin_order_text(order),
+        reply_markup=admin_order_kb(order_id, order["status"], has_courier=True),
+        order_id=order_id,
+        context="admin",
+    )
 
-    try:
-        await message.bot.edit_message_text(
-            chat_id=order["user_id"],
-            message_id=order["user_message_id"],
-            text=_user_order_text(
-                order["user_name"], order["phone"], order["address"],
-                order["items"], status=order["status"], courier=order.get("courier")
-            )
-        )
-        await message.bot.send_message(order["user_id"], f"Назначен курьер: {courier} 🚚")
-    except TelegramBadRequest as exc:
-        logger.warning(
-            "Не удалось обновить сообщение клиента для заказа %s: %s",
-            order_id,
-            exc,
-        )
+    await safe_edit_message_text(
+        message.bot,
+        chat_id=order["user_id"],
+        message_id=order["user_message_id"],
+        text=_user_order_text(
+            order["user_name"], order["phone"], order["address"],
+            order["items"], status=order["status"], courier=order.get("courier")
+        ),
+        order_id=order_id,
+        context="client",
+    )
+    await message.bot.send_message(order["user_id"], f"Назначен курьер: {courier} 🚚")
 
     await state.clear()
     await message.reply(f"Курьер назначен: {courier}")
