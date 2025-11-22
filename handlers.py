@@ -494,16 +494,20 @@ async def admin_actions(callback: CallbackQuery, state: FSMContext):
                 reply_markup=admin_order_kb(order_id, order["status"], has_courier=bool(order.get("courier"))),
             )
         except TelegramBadRequest as exc:
-            if "message is not modified" in exc.message:
+            logger.warning(
+                "Не удалось обновить сообщение администратора для заказа %s: %s",
+                order_id,
+                exc,
+            )
+            exc_text = str(exc)
+            if "message is not modified" in exc_text:
                 logger.info("Сообщение администратора не изменилось для заказа %s", order_id)
-            elif "message to edit not found" in exc.message:
+            elif "message to edit not found" in exc_text:
                 logger.warning("Админское сообщение не найдено, отправляем новое для заказа %s", order_id)
                 await callback.message.answer(
                     _admin_order_text(order),
                     reply_markup=admin_order_kb(order_id, order["status"], has_courier=bool(order.get("courier"))),
                 )
-            else:
-                raise
 
         user_markup = post_order_kb(order_id) if order["status"] in ("delivered", "canceled") else None
         user_text = _user_order_text(
@@ -525,11 +529,12 @@ async def admin_actions(callback: CallbackQuery, state: FSMContext):
                     reply_markup=user_markup,
                 )
             except TelegramBadRequest as exc:
-                if "message is not modified" in exc.message:
+                exc_text = str(exc)
+                if "message is not modified" in exc_text:
                     logger.info("Сообщение клиента без изменений для заказа %s", order_id)
                 else:
                     logger.warning(
-                        "Не удалось отредактировать сообщение клиента для заказа %s: %s. Отправляем новое.",
+                        "Не удалось обновить сообщение клиента для заказа %s: %s",
                         order_id,
                         exc,
                     )
@@ -541,9 +546,9 @@ async def admin_actions(callback: CallbackQuery, state: FSMContext):
                         )
                         set_user_message_id(order_id, new_msg.message_id)
                     except Exception:
-                        logger.exception("Не удалось отправить новое сообщение клиенту для заказа %s", order_id)
+                        logger.error("Не удалось отправить новое сообщение клиенту для заказа %s", order_id)
             except Exception:
-                logger.exception("Не удалось обновить сообщение клиента для заказа %s", order_id)
+                logger.error("Не удалось обновить сообщение клиента для заказа %s", order_id)
         else:
             logger.warning("Для заказа %s нет user_message_id. Отправляем новое сообщение.", order_id)
             try:
@@ -607,16 +612,20 @@ async def admin_actions(callback: CallbackQuery, state: FSMContext):
                 reply_markup=admin_order_kb(order_id, order["status"], has_courier=bool(order.get("courier"))),
             )
         except TelegramBadRequest as exc:
-            if "message is not modified" in exc.message:
+            logger.warning(
+                "Не удалось обновить сообщение администратора для заказа %s: %s",
+                order_id,
+                exc,
+            )
+            exc_text = str(exc)
+            if "message is not modified" in exc_text:
                 logger.info("Сообщение администратора без изменений для заказа %s", order_id)
-            elif "message to edit not found" in exc.message:
+            elif "message to edit not found" in exc_text:
                 logger.warning("Админское сообщение не найдено при refresh, отправляем новое для заказа %s", order_id)
                 await callback.message.answer(
                     _admin_order_text(order),
                     reply_markup=admin_order_kb(order_id, order["status"], has_courier=bool(order.get("courier"))),
                 )
-            else:
-                raise
         await callback.answer("Обновлено")
 
 @router.message(AdminStates.waiting_courier_name, F.chat.type.in_({"group", "supergroup"}))
@@ -648,8 +657,12 @@ async def set_courier_name(message: Message, state: FSMContext):
             text=_admin_order_text(order),
             reply_markup=admin_order_kb(order_id, order["status"], has_courier=True)
         )
-    except Exception:
-        pass
+    except TelegramBadRequest as exc:
+        logger.warning(
+            "Не удалось обновить сообщение администратора для заказа %s: %s",
+            order_id,
+            exc,
+        )
 
     try:
         await message.bot.edit_message_text(
@@ -661,8 +674,12 @@ async def set_courier_name(message: Message, state: FSMContext):
             )
         )
         await message.bot.send_message(order["user_id"], f"Назначен курьер: {courier} 🚚")
-    except Exception:
-        pass
+    except TelegramBadRequest as exc:
+        logger.warning(
+            "Не удалось обновить сообщение клиента для заказа %s: %s",
+            order_id,
+            exc,
+        )
 
     await state.clear()
     await message.reply(f"Курьер назначен: {courier}")
