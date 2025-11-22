@@ -1,43 +1,43 @@
-from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery
+import asyncio
+from datetime import datetime, timedelta
+
+from aiogram import F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from datetime import datetime, timedelta
-import asyncio
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from db import get_order, get_client
-from config import ADMIN_GROUP_ID
-
-from keyboards import (
-    start_kb, categories_kb, list_dishes_kb,
-    cart_kb, admin_order_kb, post_order_kb
-)
-from data import MENU, CATEGORY_TITLES
 from config import ADMIN_GROUP_ID, ADMIN_IDS
+from data import CATEGORY_TITLES, MENU
 from db import (
-    create_order, get_order, update_status, set_courier,
-    set_group_message_id, set_user_message_id,
-    get_last_order
+    DBError,
+    create_order,
+    get_client,
+    get_last_order,
+    get_order,
+    save_client,
+    set_courier,
+    set_group_message_id,
+    set_user_message_id,
+    update_status,
 )
+from keyboards import (
+    admin_order_kb,
+    cart_kb,
+    categories_kb,
+    list_dishes_kb,
+    post_order_kb,
+    start_kb,
+)
+from logger import get_logger
+from utils import _safe_split, cart_total, format_cart, progress_text
+from telegram_utils import safe_edit_message_text
 
 # ----------------- Router -----------------
 router = Router()
+logger = get_logger(__name__)
 
 # ----------------- Утилиты -----------------
-def cart_total(cart) -> int:
-    return sum(item["price"] * item.get("qty", 1) for item in cart)
-
-def format_cart(cart) -> str:
-    if not cart:
-        return "Корзина пуста."
-    lines = [f"• {i['name']} ×{i.get('qty',1)} — {i['price']*i.get('qty',1)}₽" for i in cart]
-    total = cart_total(cart)
-    lines.append(f"\nИтого: <b>{total}₽</b>")
-    return "\n".join(lines)
-
-STATUS_FLOW = ["new", "preparing", "ready", "handoff", "onway", "delivered", "canceled"]
 STATUS_ICONS = {
     "new": "🆕", "preparing": "🧑‍🍳", "ready": "✅",
     "handoff": "📦", "onway": "🚚", "delivered": "🏁", "canceled": "❌",
@@ -51,22 +51,6 @@ STATUS_TITLES_RU = {
     "delivered": "Заказ доставлен",
     "canceled": "Заказ отменён",
 }
-
-def progress_text(current: str) -> str:
-    steps = [
-        ("preparing", "🧑‍🍳 Готовим"),
-        ("ready", "✅ Готов"),
-        ("handoff", "📦 Передаём курьеру"),
-        ("onway", "🚚 В пути"),
-        ("delivered", "🏁 Доставлен"),
-    ]
-    cur_idx = STATUS_FLOW.index(current) if current in STATUS_FLOW else 0
-    lines = []
-    for s, title in steps:
-        idx = STATUS_FLOW.index(s)
-        mark = "✅" if idx <= cur_idx and current != "canceled" else ("⏳" if current != "canceled" else "—")
-        lines.append(f"• {title} — {mark}")
-    return "\n".join(lines)
 
 def _user_order_text(name: str, phone: str, address: str, cart: list, status: str, courier: str | None) -> str:
     items_text = "\n".join(f"• {i['name']} ×{i.get('qty',1)} — {i['price']*i.get('qty',1)}₽" for i in cart)
@@ -155,17 +139,35 @@ async def cmd_status(message: Message):
     await message.answer(text)
 
 
-# ----------------- test -----------------
+# ----------------- Каталог и корзина -----------------
+@router.callback_query(F.data == "make_order")
+async def make_order(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(OrderStates.choosing_category)
+    await state.update_data(cart=[])
+    await callback.message.edit_text("Выберите категорию:", reply_markup=categories_kb())
+    await callback.answer()
+
+
 @router.callback_query(F.data.startswith("cat:"), OrderStates.choosing_category)
 async def show_list(callback: CallbackQuery, state: FSMContext):
-    _, category_key = callback.data.split(":")
+    try:
+        _, category_key = _safe_split(callback.data, 2)
+    except ValueError:
+        await callback.answer("Некорректные данные", show_alert=True)
+        return
+
     data = await state.get_data()
     cart = data.get("cart", [])
 
     qty_sum = sum(i.get("qty", 1) for i in cart)
     total = cart_total(cart)
-
-    cart_lines = "\n".join(f"• {i['name']} ×{i['qty']} — {i['price']*i['qty']}₽" for i in cart) if cart else "Корзина пуста."
+    cart_lines = (
+        "\n".join(
+            f"• {i['name']} ×{i.get('qty',1)} — {i['price']*i.get('qty',1)}₽" for i in cart
+        )
+        if cart
+        else "Корзина пуста."
+    )
     header = (
         f"Категория: <b>{CATEGORY_TITLES.get(category_key, category_key)}</b>\n"
         f"В корзине: {qty_sum} поз. • {total}₽\n"
@@ -179,15 +181,20 @@ async def show_list(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("dish:"), OrderStates.choosing_category)
 async def add_dish(callback: CallbackQuery, state: FSMContext):
-    _, category_key, dish_id_str, page_str = callback.data.split(":")
-    dish = next((d for d in MENU.get(category_key, []) if d["id"] == int(dish_id_str)), None)
+    try:
+        _, category_key, dish_id_str, page_str = _safe_split(callback.data, 4)
+        dish_id = int(dish_id_str)
+    except Exception:
+        await callback.answer("Некорректные данные блюда", show_alert=True)
+        return
+
+    dish = next((d for d in MENU.get(category_key, []) if d["id"] == dish_id), None)
     if not dish:
         await callback.answer("Блюдо не найдено", show_alert=True)
         return
 
     data = await state.get_data()
     cart = data.get("cart", [])
-    # добавляем в корзину
     for item in cart:
         if item["name"] == dish["name"]:
             item["qty"] += 1
@@ -199,7 +206,9 @@ async def add_dish(callback: CallbackQuery, state: FSMContext):
 
     qty_sum = sum(i.get("qty", 1) for i in cart)
     total = cart_total(cart)
-    cart_lines = "\n".join(f"• {i['name']} ×{i['qty']} — {i['price']*i['qty']}₽" for i in cart)
+    cart_lines = "\n".join(
+        f"• {i['name']} ×{i.get('qty',1)} — {i['price']*i.get('qty',1)}₽" for i in cart
+    )
 
     header = (
         f"Категория: <b>{CATEGORY_TITLES.get(category_key, category_key)}</b>\n"
@@ -211,6 +220,208 @@ async def add_dish(callback: CallbackQuery, state: FSMContext):
     page = int(page_str) if page_str.lstrip("-").isdigit() else 0
     await callback.message.edit_text(header, reply_markup=list_dishes_kb(category_key, page=page))
     await callback.answer(f"{dish['name']} добавлено ✅")
+
+
+@router.callback_query(F.data == "show_cart", OrderStates.choosing_category)
+async def show_cart(callback: CallbackQuery, state: FSMContext):
+    cart = (await state.get_data()).get("cart", [])
+    await callback.message.edit_text(f"🧺 <b>Корзина</b>\n\n{format_cart(cart)}", reply_markup=cart_kb(cart))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "clear_cart", OrderStates.choosing_category)
+async def clear_cart(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(cart=[])
+    await callback.message.edit_text("🧺 Корзина очищена.\n\nВыберите категорию:", reply_markup=categories_kb())
+    await callback.answer("Корзина очищена")
+
+
+@router.callback_query(F.data == "back_to_categories", OrderStates.choosing_category)
+async def back_to_categories(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Выберите категорию:", reply_markup=categories_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "back_to_start")
+async def back_to_start(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(OrderStates.choosing_category)
+    await callback.message.edit_text("Нажмите кнопку ниже, чтобы начать заказ:", reply_markup=start_kb())
+    await callback.answer()
+
+
+# ----------------- Оформление заказа -----------------
+@router.callback_query(F.data == "checkout", OrderStates.choosing_category)
+async def checkout(callback: CallbackQuery, state: FSMContext):
+    cart = (await state.get_data()).get("cart", [])
+    if not cart:
+        await callback.answer("Корзина пуста ❌", show_alert=True)
+        return
+
+    try:
+        client = get_client(callback.from_user.id)
+    except DBError:
+        client = None
+        logger.exception("Не удалось загрузить данные клиента")
+
+    if client:
+        await state.update_data(
+            name=client["name"],
+            phone=client["phone"],
+            address=client["address"],
+        )
+        await callback.message.edit_text(
+            f"Мы нашли ваши данные:\n"
+            f"👤 Имя: {client['name']}\n"
+            f"📞 Телефон: {client['phone']}\n"
+            f"📍 Адрес: {client['address']}\n\n"
+            f"Подтверждаете или хотите ввести заново?",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="✅ Подтвердить", callback_data="confirm_client")],
+                    [InlineKeyboardButton(text="✏ Ввести заново", callback_data="edit_client")],
+                ]
+            ),
+        )
+        return
+
+    await callback.message.edit_text("Введите ваше имя:")
+    await state.set_state(OrderStates.waiting_for_name)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "confirm_client", OrderStates.choosing_category)
+async def confirm_client(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    await state.update_data(address=data.get("address"))
+    await enter_address(callback.message, state)
+
+
+@router.callback_query(F.data == "edit_client", OrderStates.choosing_category)
+async def edit_client(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Введите ваше имя:")
+    await state.set_state(OrderStates.waiting_for_name)
+    await callback.answer()
+
+
+@router.message(OrderStates.waiting_for_name)
+async def enter_name(message: Message, state: FSMContext):
+    if not (message.text or "").strip():
+        await message.answer("Имя не может быть пустым. Введите снова:")
+        return
+    await state.update_data(name=message.text.strip())
+    await message.answer("Введите номер телефона (только цифры и +):")
+    await state.set_state(OrderStates.waiting_for_phone)
+
+
+@router.message(OrderStates.waiting_for_phone)
+async def enter_phone(message: Message, state: FSMContext):
+    phone = (message.text or "").strip()
+    if not phone or any(ch for ch in phone if not (ch.isdigit() or ch == "+")):
+        await message.answer("Телефон должен содержать только цифры и +. Введите снова:")
+        return
+    await state.update_data(phone=phone)
+    await message.answer("Введите адрес доставки:")
+    await state.set_state(OrderStates.waiting_for_address)
+
+
+@router.message(OrderStates.waiting_for_address)
+async def enter_address(message: Message, state: FSMContext):
+    data = await state.get_data()
+    cart = data.get("cart", [])
+    name = data.get("name", "")
+    phone = data.get("phone", "")
+    address = (message.text or "").strip()
+
+    try:
+        order_id = create_order(
+            user_id=message.from_user.id,
+            user_name=message.from_user.full_name,
+            user_username=message.from_user.username,
+            phone=phone,
+            address=address,
+            items=cart,
+            total=cart_total(cart),
+            status="new",
+        )
+        save_client(message.from_user.id, name, phone, address)
+    except DBError:
+        logger.exception("Не удалось создать заказ")
+        await message.answer("Не удалось оформить заказ. Попробуйте ещё раз позже ❌")
+        return
+
+    user_msg = await message.answer(
+        _user_order_text(name, phone, address, cart, status="new", courier=None)
+    )
+    set_user_message_id(order_id, user_msg.message_id)
+
+    if ADMIN_GROUP_ID:
+        try:
+            admin_msg = await message.bot.send_message(
+                chat_id=ADMIN_GROUP_ID,
+                text=_admin_order_text(
+                    {
+                        "id": order_id,
+                        "items": cart,
+                        "total": cart_total(cart),
+                        "user_id": message.from_user.id,
+                        "user_username": message.from_user.username,
+                        "user_name": message.from_user.full_name,
+                        "phone": phone,
+                        "address": address,
+                        "courier": None,
+                        "status": "new",
+                    }
+                ),
+                reply_markup=admin_order_kb(order_id, "new", has_courier=False),
+            )
+            set_group_message_id(order_id, admin_msg.message_id)
+        except Exception:
+            logger.exception("Не удалось отправить сообщение в группу %s", ADMIN_GROUP_ID)
+
+    await state.clear()
+
+
+# ----------------- Повтор заказа -----------------
+@router.callback_query(F.data == "new_order")
+async def new_order(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(OrderStates.choosing_category)
+    await state.update_data(cart=[])
+    await callback.message.answer("Выберите категорию:", reply_markup=categories_kb())
+    await callback.answer("Новый заказ")
+
+
+@router.callback_query(F.data.startswith("reorder:"))
+async def reorder(callback: CallbackQuery, state: FSMContext):
+    try:
+        _, order_id_str = _safe_split(callback.data, 2)
+        order_id = int(order_id_str)
+    except Exception:
+        await callback.answer("Некорректный заказ", show_alert=True)
+        return
+
+    try:
+        order = get_order(order_id)
+    except DBError:
+        logger.exception("Не удалось загрузить заказ %s", order_id)
+        order = None
+    if not order:
+        await callback.answer("Заказ не найден", show_alert=True)
+        return
+
+    if order["user_id"] != callback.from_user.id:
+        await callback.answer("Это не ваш заказ", show_alert=True)
+        return
+
+    await state.set_state(OrderStates.choosing_category)
+    await state.update_data(cart=order["items"])
+    await callback.message.answer(
+        f"🔁 Корзина восстановлена из заказа #{order_id}\n\n{format_cart(order['items'])}",
+        reply_markup=cart_kb(order["items"]),
+    )
+    await callback.answer("Корзина восстановлена")
+
 
 # ----------------- Поиск заказа по номеру -----------------
 @router.message(Command("find"))
@@ -225,243 +436,20 @@ async def cmd_find(message: Message):
         return
 
     order_id = int(parts[1])
-    order = get_order(order_id)
-    if not order:
-        await message.answer("Заказ не найден ❌")
-        return
-
-    await message.answer(
-        _admin_order_text(order),
-        reply_markup=admin_order_kb(order_id, order["status"], has_courier=bool(order.get("courier")))
-    )
-
-
-# ----------------- Автоподстановка клиента -----------------
-@router.callback_query(F.data == "checkout", OrderStates.choosing_category)
-async def checkout(callback: CallbackQuery, state: FSMContext):
-    cart = (await state.get_data()).get("cart", [])
-    if not cart:
-        await callback.answer("Корзина пуста ❌", show_alert=True)
-        return
-
-    # проверка клиента
-    client = get_client(callback.from_user.id)
-    if client:
-        await state.update_data(
-            name=client["name"],
-            phone=client["phone"],
-            address=client["address"]
-        )
-        await callback.message.edit_text(
-            f"Мы нашли ваши данные:\n"
-            f"👤 Имя: {client['name']}\n"
-            f"📞 Телефон: {client['phone']}\n"
-            f"📍 Адрес: {client['address']}\n\n"
-            f"Подтверждаете или хотите ввести заново?",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="✅ Подтвердить", callback_data="confirm_client")],
-                [InlineKeyboardButton(text="✏ Ввести заново", callback_data="edit_client")]
-            ])
-        )
-        return
-
-    await callback.message.edit_text("Введите ваше имя:")
-    await state.set_state(OrderStates.waiting_for_name)
-    await callback.answer()
-
-@router.callback_query(F.data == "confirm_client", OrderStates.choosing_category)
-async def confirm_client(callback: CallbackQuery, state: FSMContext):
-    # сразу переходим к финальному шагу (адрес у нас уже есть из базы)
-    data = await state.get_data()
-    await state.update_data(address=data.get("address"))
-    await enter_address(callback.message, state)
-
-@router.callback_query(F.data == "edit_client", OrderStates.choosing_category)
-async def edit_client(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("Введите ваше имя:")
-    await state.set_state(OrderStates.waiting_for_name)
-    await callback.answer()
-
-# ----------------- Кнопки после доставки/отмены -----------------
-@router.callback_query(F.data == "new_order")
-async def new_order(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await state.set_state(OrderStates.choosing_category)
-    await state.update_data(cart=[])
-    await callback.message.answer("Выберите категорию:", reply_markup=categories_kb())
-    await callback.answer("Новый заказ")
-
-@router.callback_query(F.data.startswith("reorder:"))
-async def reorder(callback: CallbackQuery, state: FSMContext):
     try:
-        order_id = int(callback.data.split(":")[1])
-    except Exception:
-        await callback.answer("Некорректный заказ", show_alert=True)
-        return
-
-    order = get_order(order_id)
-    if not order:
-        await callback.answer("Заказ не найден", show_alert=True)
-        return
-
-    if order["user_id"] != callback.from_user.id:
-        await callback.answer("Это не ваш заказ", show_alert=True)
-        return
-
-    await state.set_state(OrderStates.choosing_category)
-    await state.update_data(cart=order["items"])
-    await callback.message.answer(
-        f"🔁 Корзина восстановлена из заказа #{order_id}\n\n{format_cart(order['items'])}",
-        reply_markup=cart_kb(order["items"])
-    )
-    await callback.answer("Корзина восстановлена")
-
-# ----------------- Callback-кнопки клиента -----------------
-@router.callback_query(F.data == "make_order")
-async def make_order(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(OrderStates.choosing_category)
-    await state.update_data(cart=[])
-    await callback.message.edit_text("Выберите категорию:", reply_markup=categories_kb())
-    await callback.answer()
-
-@router.callback_query(F.data.startswith("cat:"), OrderStates.choosing_category)
-async def show_list(callback: CallbackQuery, state: FSMContext):
-    _, category_key = callback.data.split(":")
-    cart = (await state.get_data()).get("cart", [])
-    header = f"Категория: <b>{CATEGORY_TITLES.get(category_key, category_key)}</b>\n\nВыберите блюдо:"
-    await callback.message.edit_text(header, reply_markup=list_dishes_kb(category_key, page=0))
-    await callback.answer()
-
-@router.callback_query(F.data.startswith("dish:"), OrderStates.choosing_category)
-async def add_dish(callback: CallbackQuery, state: FSMContext):
-    _, category_key, dish_id_str, page_str = callback.data.split(":")
-    dish = next((d for d in MENU.get(category_key, []) if d["id"] == int(dish_id_str)), None)
-    if not dish:
-        await callback.answer("Блюдо не найдено", show_alert=True)
-        return
-    data = await state.get_data()
-    cart = data.get("cart", [])
-    cart.append({"name": dish["name"], "price": dish["price"], "qty": 1})
-    await state.update_data(cart=cart)
-    await callback.answer(f"{dish['name']} добавлено ✅")
-
-@router.callback_query(F.data == "show_cart", OrderStates.choosing_category)
-async def show_cart(callback: CallbackQuery, state: FSMContext):
-    cart = (await state.get_data()).get("cart", [])
-    await callback.message.edit_text(f"🧺 <b>Корзина</b>\n\n{format_cart(cart)}", reply_markup=cart_kb(cart))
-    await callback.answer()
-
-@router.callback_query(F.data == "clear_cart", OrderStates.choosing_category)
-async def clear_cart(callback: CallbackQuery, state: FSMContext):
-    await state.update_data(cart=[])
-    await callback.message.edit_text("🧺 Корзина очищена.\n\nВыберите категорию:", reply_markup=categories_kb())
-    await callback.answer("Корзина очищена")
-
-@router.callback_query(F.data == "back_to_categories", OrderStates.choosing_category)
-async def back_to_categories(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("Выберите категорию:", reply_markup=categories_kb())
-    await callback.answer()
-
-@router.callback_query(F.data == "back_to_start")
-async def back_to_start(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await state.set_state(OrderStates.choosing_category)
-    await callback.message.edit_text("Нажмите кнопку ниже, чтобы начать заказ:", reply_markup=start_kb())
-    await callback.answer()
-
-# ----------------- Оформление заказа -----------------
-@router.callback_query(F.data == "checkout", OrderStates.choosing_category)
-async def checkout(callback: CallbackQuery, state: FSMContext):
-    cart = (await state.get_data()).get("cart", [])
-    if not cart:
-        await callback.answer("Корзина пуста ❌", show_alert=True)
-        return
-    await callback.message.edit_text("Введите ваше имя:")
-    await state.set_state(OrderStates.waiting_for_name)
-    await callback.answer()
-
-@router.message(Command("find"))
-async def cmd_find(message: Message):
-    if not is_admin_user(message.from_user.id):
-        await message.answer("Недостаточно прав ❌")
-        return
-    
-    parts = message.text.split()
-    if len(parts) < 2 or not parts[1].isdigit():
-        await message.answer("Использование: /find <номер заказа>")
-        return
-    
-    order_id = int(parts[1])
-    order = get_order(order_id)
+        order = get_order(order_id)
+    except DBError:
+        logger.exception("Не удалось получить заказ %s", order_id)
+        order = None
     if not order:
         await message.answer("Заказ не найден ❌")
         return
-    
+
     await message.answer(
         _admin_order_text(order),
-        reply_markup=admin_order_kb(order_id, order["status"], has_courier=bool(order.get("courier")))
+        reply_markup=admin_order_kb(order_id, order["status"], has_courier=bool(order.get("courier"))),
     )
 
-
-@router.message(OrderStates.waiting_for_name)
-async def enter_name(message: Message, state: FSMContext):
-    if not message.text.strip():
-        await message.answer("Имя не может быть пустым. Введите снова:")
-        return
-    await state.update_data(name=message.text.strip())
-    await message.answer("Введите номер телефона:")
-    await state.set_state(OrderStates.waiting_for_phone)
-
-@router.message(OrderStates.waiting_for_phone)
-async def enter_phone(message: Message, state: FSMContext):
-    phone = message.text.strip()
-    await state.update_data(phone=phone)
-    await message.answer("Введите адрес доставки:")
-    await state.set_state(OrderStates.waiting_for_address)
-
-@router.message(OrderStates.waiting_for_address)
-async def enter_address(message: Message, state: FSMContext):
-    data = await state.get_data()
-    cart = data.get("cart", [])
-    name = data.get("name", "")
-    phone = data.get("phone", "")
-    address = message.text.strip()
-
-    order_id = create_order(
-        user_id=message.from_user.id,
-        user_name=message.from_user.full_name,
-        user_username=message.from_user.username,
-        phone=phone,
-        address=address,
-        items=cart,
-        total=cart_total(cart),
-        status="new",
-    )
-
-    # сообщение клиенту
-    user_msg = await message.answer(
-        _user_order_text(name, phone, address, cart, status="new", courier=None)
-    )
-    set_user_message_id(order_id, user_msg.message_id)
-
-    # сообщение в админ-группу
-    if ADMIN_GROUP_ID:
-        try:
-            admin_msg = await message.bot.send_message(
-                chat_id=ADMIN_GROUP_ID,
-                text=_admin_order_text({
-                    "id": order_id, "items": cart, "total": cart_total(cart),
-                    "user_id": message.from_user.id, "user_username": message.from_user.username,
-                    "user_name": message.from_user.full_name, "phone": phone, "address": address,
-                    "courier": None, "status": "new"
-                }),
-                reply_markup=admin_order_kb(order_id, "new", has_courier=False)
-            )
-            set_group_message_id(order_id, admin_msg.message_id)
-        except Exception as e:
-            print(f"[WARN] Не удалось отправить в группу {ADMIN_GROUP_ID}: {e}")
-
-    await state.clear()
 
 # ----------------- Админская часть -----------------
 @router.callback_query(F.data.startswith("order:"), F.message.chat.type.in_({"group", "supergroup"}))
@@ -470,75 +458,164 @@ async def admin_actions(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
 
-    parts = callback.data.split(":")
-    action = parts[1]
+    try:
+        _, action, *rest = _safe_split(callback.data, 3)
+    except ValueError:
+        await callback.answer("Некорректные данные", show_alert=True)
+        return
 
     if action == "set":
-        order_id = int(parts[2]); new_status = parts[3]
-        order = get_order(order_id)
-        if not order:
-            await callback.answer("Заказ не найден", show_alert=True); return
-
-        update_status(order_id, new_status)
-        order = get_order(order_id)
-
-        await callback.message.edit_text(
-            _admin_order_text(order),
-            reply_markup=admin_order_kb(order_id, order["status"], has_courier=bool(order.get("courier")))
-        )
-
-        user_markup = post_order_kb(order_id) if order["status"] in ("delivered", "canceled") else None
+        try:
+            order_id = int(rest[0]); new_status = rest[1]
+        except Exception:
+            await callback.answer("Некорректные данные заказа", show_alert=True)
+            return
 
         try:
-            await callback.bot.edit_message_text(
-                chat_id=order["user_id"],
-                message_id=order["user_message_id"],
-                text=_user_order_text(
-                    order["user_name"], order["phone"], order["address"],
-                    order["items"], status=order["status"], courier=order.get("courier")
-                ),
-                reply_markup=user_markup
-            )
+            order = get_order(order_id)
+        except DBError:
+            logger.exception("Не удалось загрузить заказ %s", order_id)
+            order = None
+        if not order:
+            await callback.answer("Заказ не найден", show_alert=True)
+            return
 
-            # благодарность или отмена
+        try:
+            update_status(order_id, new_status)
+            order = get_order(order_id)
+        except DBError:
+            logger.exception("Не удалось обновить статус заказа %s", order_id)
+            await callback.answer("Ошибка обновления статуса", show_alert=True)
+            return
+
+        exc_text = await safe_edit_message_text(
+            callback.message.bot,
+            chat_id=callback.message.chat.id,
+            message_id=callback.message.message_id,
+            text=_admin_order_text(order),
+            reply_markup=admin_order_kb(order_id, order["status"], has_courier=bool(order.get("courier"))),
+            order_id=order_id,
+            context="admin",
+        )
+        if exc_text:
+            if "message is not modified" in exc_text:
+                logger.info("Сообщение администратора не изменилось для заказа %s", order_id)
+            elif "message to edit not found" in exc_text:
+                logger.warning("Админское сообщение не найдено, отправляем новое для заказа %s", order_id)
+                await callback.message.answer(
+                    _admin_order_text(order),
+                    reply_markup=admin_order_kb(order_id, order["status"], has_courier=bool(order.get("courier"))),
+                )
+
+        user_markup = post_order_kb(order_id) if order["status"] in ("delivered", "canceled") else None
+        user_text = _user_order_text(
+            order["user_name"],
+            order["phone"],
+            order["address"],
+            order["items"],
+            status=order["status"],
+            courier=order.get("courier"),
+        )
+
+        user_message_id = order.get("user_message_id")
+        if user_message_id:
+            exc_text = await safe_edit_message_text(
+                callback.bot,
+                chat_id=order["user_id"],
+                message_id=user_message_id,
+                text=user_text,
+                reply_markup=user_markup,
+                order_id=order_id,
+                context="client",
+            )
+            if exc_text:
+                if "message is not modified" in exc_text:
+                    logger.info("Сообщение клиента без изменений для заказа %s", order_id)
+                else:
+                    try:
+                        new_msg = await callback.bot.send_message(
+                            chat_id=order["user_id"],
+                            text=user_text,
+                            reply_markup=user_markup,
+                        )
+                        set_user_message_id(order_id, new_msg.message_id)
+                    except Exception:
+                        logger.error("Не удалось отправить новое сообщение клиенту для заказа %s", order_id)
+        else:
+            logger.warning("Для заказа %s нет user_message_id. Отправляем новое сообщение.", order_id)
+            try:
+                new_msg = await callback.bot.send_message(
+                    chat_id=order["user_id"],
+                    text=user_text,
+                    reply_markup=user_markup,
+                )
+                set_user_message_id(order_id, new_msg.message_id)
+            except Exception:
+                logger.exception("Не удалось отправить новое сообщение клиенту для заказа %s", order_id)
+
+        try:
             if order["status"] == "delivered":
                 await callback.bot.send_message(
                     chat_id=order["user_id"],
                     text="🙏 Спасибо за заказ! Мы очень ценим ваше доверие ❤️",
-                    reply_markup=post_order_kb(order_id)
+                    reply_markup=post_order_kb(order_id),
                 )
             elif order["status"] == "canceled":
                 await callback.bot.send_message(
                     chat_id=order["user_id"],
                     text="❌ Ваш заказ был отменён. Но вы всегда можете оформить новый заказ 🛒",
-                    reply_markup=post_order_kb(order_id)
+                    reply_markup=post_order_kb(order_id),
                 )
             else:
                 await callback.bot.send_message(
                     chat_id=order["user_id"],
-                    text=f"{STATUS_TITLES_RU.get(order['status'], order['status'])} {STATUS_ICONS.get(order['status'],'')}"
+                    text=f"{STATUS_TITLES_RU.get(order['status'], order['status'])} {STATUS_ICONS.get(order['status'],'')}",
                 )
         except Exception:
-            pass
+            logger.exception("Не удалось отправить уведомление клиенту для заказа %s", order_id)
 
-        await callback.answer("Статус обновлён"); return
+        await callback.answer("Статус обновлён")
+        return
 
     if action == "setcourier":
-        order_id = int(parts[2])
+        try:
+            order_id = int(rest[0])
+        except Exception:
+            await callback.answer("Некорректные данные заказа", show_alert=True)
+            return
         await state.update_data(order_id_for_courier=order_id)
         await state.set_state(AdminStates.waiting_courier_name)
         await callback.answer()
         await callback.message.reply("Введите имя/позывной курьера одним сообщением:")
 
     if action == "refresh":
-        order_id = int(parts[2])
-        order = get_order(order_id)
+        try:
+            order_id = int(rest[0])
+            order = get_order(order_id)
+        except Exception:
+            await callback.answer("Ошибка при обновлении", show_alert=True)
+            return
         if not order:
-            await callback.answer("Заказ не найден", show_alert=True); return
-        await callback.message.edit_text(
-            _admin_order_text(order),
-            reply_markup=admin_order_kb(order_id, order["status"], has_courier=bool(order.get("courier")))
+            await callback.answer("Заказ не найден", show_alert=True)
+            return
+        exc_text = await safe_edit_message_text(
+            callback.message.bot,
+            chat_id=callback.message.chat.id,
+            message_id=callback.message.message_id,
+            text=_admin_order_text(order),
+            reply_markup=admin_order_kb(order_id, order["status"], has_courier=bool(order.get("courier"))),
+            order_id=order_id,
+            context="admin",
         )
+        if exc_text:
+            if "message is not modified" in exc_text:
+                logger.info("Сообщение администратора без изменений для заказа %s", order_id)
+            elif "message to edit not found" in exc_text:
+                logger.warning("Админское сообщение не найдено при refresh, отправляем новое для заказа %s", order_id)
+                await callback.message.answer(
+                    _admin_order_text(order),
+                    reply_markup=admin_order_kb(order_id, order["status"], has_courier=bool(order.get("courier"))),
+                )
         await callback.answer("Обновлено")
 
 @router.message(AdminStates.waiting_courier_name, F.chat.type.in_({"group", "supergroup"}))
@@ -555,31 +632,36 @@ async def set_courier_name(message: Message, state: FSMContext):
     if not courier:
         await message.reply("Имя курьера не может быть пустым. Повторите:"); return
 
-    set_courier(order_id, courier)
-    order = get_order(order_id)
-
     try:
-        await message.bot.edit_message_text(
-            chat_id=message.chat.id,
-            message_id=order["group_message_id"],
-            text=_admin_order_text(order),
-            reply_markup=admin_order_kb(order_id, order["status"], has_courier=True)
-        )
-    except Exception:
-        pass
+        set_courier(order_id, courier)
+        order = get_order(order_id)
+    except DBError:
+        logger.exception("Не удалось назначить курьера для заказа %s", order_id)
+        await message.reply("Ошибка сохранения курьера. Попробуйте ещё раз")
+        return
 
-    try:
-        await message.bot.edit_message_text(
-            chat_id=order["user_id"],
-            message_id=order["user_message_id"],
-            text=_user_order_text(
-                order["user_name"], order["phone"], order["address"],
-                order["items"], status=order["status"], courier=order.get("courier")
-            )
-        )
-        await message.bot.send_message(order["user_id"], f"Назначен курьер: {courier} 🚚")
-    except Exception:
-        pass
+    await safe_edit_message_text(
+        message.bot,
+        chat_id=message.chat.id,
+        message_id=order["group_message_id"],
+        text=_admin_order_text(order),
+        reply_markup=admin_order_kb(order_id, order["status"], has_courier=True),
+        order_id=order_id,
+        context="admin",
+    )
+
+    await safe_edit_message_text(
+        message.bot,
+        chat_id=order["user_id"],
+        message_id=order["user_message_id"],
+        text=_user_order_text(
+            order["user_name"], order["phone"], order["address"],
+            order["items"], status=order["status"], courier=order.get("courier")
+        ),
+        order_id=order_id,
+        context="client",
+    )
+    await message.bot.send_message(order["user_id"], f"Назначен курьер: {courier} 🚚")
 
     await state.clear()
     await message.reply(f"Курьер назначен: {courier}")
