@@ -2,6 +2,7 @@ import asyncio
 from datetime import datetime, timedelta
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -493,22 +494,54 @@ async def admin_actions(callback: CallbackQuery, state: FSMContext):
         )
 
         user_markup = post_order_kb(order_id) if order["status"] in ("delivered", "canceled") else None
+        user_text = _user_order_text(
+            order["user_name"],
+            order["phone"],
+            order["address"],
+            order["items"],
+            status=order["status"],
+            courier=order.get("courier"),
+        )
+
+        user_message_id = order.get("user_message_id")
+        if user_message_id:
+            try:
+                await callback.bot.edit_message_text(
+                    chat_id=order["user_id"],
+                    message_id=user_message_id,
+                    text=user_text,
+                    reply_markup=user_markup,
+                )
+            except TelegramBadRequest as exc:
+                logger.warning(
+                    "Не удалось отредактировать сообщение клиента для заказа %s: %s. Отправляем новое.",
+                    order_id,
+                    exc,
+                )
+                try:
+                    new_msg = await callback.bot.send_message(
+                        chat_id=order["user_id"],
+                        text=user_text,
+                        reply_markup=user_markup,
+                    )
+                    set_user_message_id(order_id, new_msg.message_id)
+                except Exception:
+                    logger.exception("Не удалось отправить новое сообщение клиенту для заказа %s", order_id)
+            except Exception:
+                logger.exception("Не удалось обновить сообщение клиента для заказа %s", order_id)
+        else:
+            logger.warning("Для заказа %s нет user_message_id. Отправляем новое сообщение.", order_id)
+            try:
+                new_msg = await callback.bot.send_message(
+                    chat_id=order["user_id"],
+                    text=user_text,
+                    reply_markup=user_markup,
+                )
+                set_user_message_id(order_id, new_msg.message_id)
+            except Exception:
+                logger.exception("Не удалось отправить новое сообщение клиенту для заказа %s", order_id)
 
         try:
-            await callback.bot.edit_message_text(
-                chat_id=order["user_id"],
-                message_id=order["user_message_id"],
-                text=_user_order_text(
-                    order["user_name"],
-                    order["phone"],
-                    order["address"],
-                    order["items"],
-                    status=order["status"],
-                    courier=order.get("courier"),
-                ),
-                reply_markup=user_markup,
-            )
-
             if order["status"] == "delivered":
                 await callback.bot.send_message(
                     chat_id=order["user_id"],
@@ -527,7 +560,7 @@ async def admin_actions(callback: CallbackQuery, state: FSMContext):
                     text=f"{STATUS_TITLES_RU.get(order['status'], order['status'])} {STATUS_ICONS.get(order['status'],'')}",
                 )
         except Exception:
-            logger.exception("Не удалось обновить сообщение клиента для заказа %s", order_id)
+            logger.exception("Не удалось отправить уведомление клиенту для заказа %s", order_id)
 
         await callback.answer("Статус обновлён")
         return
