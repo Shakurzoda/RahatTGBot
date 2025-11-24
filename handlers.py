@@ -342,9 +342,8 @@ async def enter_name(message: Message, state: FSMContext):
     await message.answer(
         "Введите номер телефона.\n\n"
         "Примеры:\n"
-        "+992 900 00 00 00\n"
-        "+7 900 000-00-00\n"
-        "900000000"
+        "+7 900 00 00 00\n"
+        "8 900 000-00-00\n"
     )
     await state.set_state(OrderStates.waiting_for_phone)
 
@@ -356,9 +355,8 @@ async def enter_phone(message: Message, state: FSMContext):
         await message.answer(
             "Пожалуйста, введите номер телефона.\n\n"
             "Примеры:\n"
-            "+992 900 00 00 00\n"
-            "+7 900 000-00-00\n"
-            "900000000"
+            "+7 900 00 00 00\n"
+            "8 900 000-00-00\n"
         )
         return
 
