@@ -54,13 +54,19 @@ def cart_kb(_cart=None) -> InlineKeyboardMarkup:
     kb.row(InlineKeyboardButton(text="⬅️ К категориям", callback_data="back_to_categories"))
     return kb.as_markup()
 
-# --- После доставки/отмены ---
+
 def post_order_kb(order_id: int) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    kb.button(text="🛒 Новый заказ", callback_data="new_order")
-    kb.button(text=f"🔁 Повторить заказ", callback_data=f"reorder:{order_id}")
-    kb.adjust(1)
-    return kb.as_markup()
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🆕 Новый заказ",
+                    callback_data="back_to_start",
+                )
+            ]
+        ]
+    )
+
 
 # -------- Админ-группа --------
 _STATUS_TITLES_RU = {
